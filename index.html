@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Canvas Draw</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 
 <style>
 * {
@@ -101,53 +102,109 @@ canvas {
 <script>
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
+const tg = window.Telegram?.WebApp;
+const params = new URLSearchParams(window.location.search);
 
 let drawing = false;
 let currentColor = '#000000';
 let brushSize = 3;
 let eraser = false;
+let currentStroke = null;
 
 const undoStack = [];
 const redoStack = [];
+let strokes = [];
+
+if (tg) {
+    tg.ready();
+    tg.expand();
+    tg.MainButton.setText('Отправить');
+    tg.MainButton.show();
+    tg.MainButton.onClick(sendDrawing);
+}
 
 function resizeCanvas() {
     const rect = canvas.parentElement.getBoundingClientRect();
 
-    const image = canvas.toDataURL();
-
     canvas.width = rect.width;
     canvas.height = rect.height;
 
-    ctx.fillStyle = 'white';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const img = new Image();
-    img.onload = () => {
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    };
-    img.src = image;
+    redrawCanvas();
 }
 
 window.addEventListener('resize', resizeCanvas);
 
 function saveState() {
-    undoStack.push(canvas.toDataURL());
+    undoStack.push(cloneStrokes(strokes));
     if (undoStack.length > 50) undoStack.shift();
     redoStack.length = 0;
 }
 
-function restoreState(data) {
-    const img = new Image();
-    img.onload = () => {
-        ctx.clearRect(0,0,canvas.width,canvas.height);
-        ctx.fillStyle = 'white';
-        ctx.fillRect(0,0,canvas.width,canvas.height);
-        ctx.drawImage(img, 0, 0);
+function cloneStrokes(value) {
+    return value.map(stroke => ({
+        color: stroke.color,
+        size: stroke.size,
+        eraser: stroke.eraser,
+        points: stroke.points.map(point => ({ x: point.x, y: point.y }))
+    }));
+}
+
+function restoreState(state) {
+    strokes = cloneStrokes(state);
+    redrawCanvas();
+}
+
+function clearCanvas() {
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function drawStroke(stroke) {
+    if (!stroke.points.length) return;
+
+    ctx.beginPath();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = stroke.size;
+    ctx.strokeStyle = stroke.eraser ? '#ffffff' : stroke.color;
+
+    const first = denormalizePoint(stroke.points[0]);
+    ctx.moveTo(first.x, first.y);
+
+    if (stroke.points.length === 1) {
+        ctx.lineTo(first.x + 0.01, first.y + 0.01);
+    } else {
+        stroke.points.slice(1).forEach(point => {
+            const p = denormalizePoint(point);
+            ctx.lineTo(p.x, p.y);
+        });
+    }
+
+    ctx.stroke();
+}
+
+function redrawCanvas() {
+    clearCanvas();
+    strokes.forEach(drawStroke);
+}
+
+function normalizePoint(point) {
+    return {
+        x: Math.max(0, Math.min(1000, Math.round(point.x * 1000 / canvas.width))),
+        y: Math.max(0, Math.min(1000, Math.round(point.y * 1000 / canvas.height)))
     };
-    img.src = data;
+}
+
+function denormalizePoint(point) {
+    return {
+        x: point.x * canvas.width / 1000,
+        y: point.y * canvas.height / 1000
+    };
 }
 
 function getPos(e) {
+    if (e.cancelable) e.preventDefault();
+
     const rect = canvas.getBoundingClientRect();
 
     if (e.touches) {
@@ -169,6 +226,14 @@ function startDraw(e) {
     drawing = true;
 
     const p = getPos(e);
+    const point = normalizePoint(p);
+    currentStroke = {
+        color: currentColor,
+        size: brushSize,
+        eraser,
+        points: [point]
+    };
+    strokes.push(currentStroke);
 
     ctx.beginPath();
     ctx.moveTo(p.x, p.y);
@@ -188,6 +253,14 @@ function draw(e) {
     if (!drawing) return;
 
     const p = getPos(e);
+    const point = normalizePoint(p);
+    const previous = currentStroke.points[currentStroke.points.length - 1];
+
+    if (previous && Math.abs(previous.x - point.x) + Math.abs(previous.y - point.y) < 3) {
+        return;
+    }
+
+    currentStroke.points.push(point);
 
     ctx.lineTo(p.x, p.y);
     ctx.stroke();
@@ -195,6 +268,7 @@ function draw(e) {
 
 function stopDraw() {
     drawing = false;
+    currentStroke = null;
 }
 
 canvas.addEventListener('mousedown', startDraw);
@@ -233,7 +307,7 @@ document.getElementById('eraser').addEventListener('click', function() {
 document.getElementById('undo').addEventListener('click', () => {
     if (!undoStack.length) return;
 
-    redoStack.push(canvas.toDataURL());
+    redoStack.push(cloneStrokes(strokes));
 
     const state = undoStack.pop();
     restoreState(state);
@@ -242,7 +316,7 @@ document.getElementById('undo').addEventListener('click', () => {
 document.getElementById('redo').addEventListener('click', () => {
     if (!redoStack.length) return;
 
-    undoStack.push(canvas.toDataURL());
+    undoStack.push(cloneStrokes(strokes));
 
     const state = redoStack.pop();
     restoreState(state);
@@ -250,15 +324,72 @@ document.getElementById('redo').addEventListener('click', () => {
 
 document.getElementById('clear').addEventListener('click', () => {
     saveState();
-
-    ctx.fillStyle = 'white';
-    ctx.fillRect(0,0,canvas.width,canvas.height);
+    strokes = [];
+    redrawCanvas();
 });
+
+function compactStrokes(maxPoints) {
+    const pointCount = strokes.reduce((sum, stroke) => sum + stroke.points.length, 0);
+    const step = Math.max(1, Math.ceil(pointCount / maxPoints));
+
+    return strokes
+        .map(stroke => {
+            const points = stroke.points.filter((_, index) => index % step === 0);
+            const last = stroke.points[stroke.points.length - 1];
+            if (last && points[points.length - 1] !== last) points.push(last);
+
+            return {
+                c: stroke.color,
+                z: stroke.size,
+                e: stroke.eraser ? 1 : 0,
+                p: points.map(point => `${point.x},${point.y}`).join(' ')
+            };
+        })
+        .filter(stroke => stroke.p);
+}
+
+function buildPayload() {
+    const base = {
+        v: 1,
+        user_id: Number(params.get('user_id')),
+        chat_id: Number(params.get('chat_id')),
+        message_id: Number(params.get('message_id')),
+        session_id: params.get('session_id'),
+        w: 512,
+        h: 512,
+        s: []
+    };
+
+    for (let maxPoints = 420; maxPoints >= 100; maxPoints -= 40) {
+        const payload = { ...base, s: compactStrokes(maxPoints) };
+        const data = JSON.stringify(payload);
+        if (new Blob([data]).size <= 3900) return data;
+    }
+
+    return null;
+}
+
+function sendDrawing() {
+    const data = buildPayload();
+
+    if (!data) {
+        tg?.showAlert('Рисунок получился слишком детальным. Упростите его или очистите часть штрихов.');
+        return;
+    }
+
+    if (!tg) {
+        console.log(data);
+        return;
+    }
+
+    tg.MainButton.showProgress();
+    tg.sendData(data);
+    tg.close();
+}
 
 resizeCanvas();
 
-ctx.fillStyle = 'white';
-ctx.fillRect(0,0,canvas.width,canvas.height);
+clearCanvas();
 </script>
 
 </body>
